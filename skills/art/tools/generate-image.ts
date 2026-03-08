@@ -4,6 +4,7 @@
  * generate-image - Image Generation CLI
  *
  * Generate images using Nano Banana 2 or Nano Banana Pro (Google Gemini).
+ * Supports Google Gemini API (direct) and OpenRouter as providers.
  * Follows llcli pattern for deterministic, composable CLI design.
  *
  * Usage:
@@ -53,12 +54,14 @@ async function loadEnv(): Promise<void> {
 // ============================================================================
 
 type Model = "nano-banana-pro" | "nano-banana-2";
+type Provider = "google" | "openrouter";
 type AspectRatio = "1:1" | "1:4" | "1:8" | "2:3" | "3:2" | "3:4" | "4:1" | "4:3" | "4:5" | "5:4" | "8:1" | "9:16" | "16:9" | "21:9";
 type GeminiSize = "512px" | "1K" | "2K" | "4K";
 type ThinkingLevel = "minimal" | "low" | "medium" | "high";
 
 interface CLIArgs {
   model: Model;
+  provider?: Provider;
   prompt: string;
   size: GeminiSize;
   output: string;
@@ -84,6 +87,18 @@ const DEFAULTS = {
 
 const GEMINI_SIZES: GeminiSize[] = ["512px", "1K", "2K", "4K"];
 const GEMINI_ASPECT_RATIOS: AspectRatio[] = ["1:1", "1:4", "1:8", "2:3", "3:2", "3:4", "4:1", "4:3", "4:5", "5:4", "8:1", "9:16", "16:9", "21:9"];
+
+const OPENROUTER_MODELS: Record<Model, string> = {
+  "nano-banana-2": "google/gemini-3.1-flash-image-preview",
+  "nano-banana-pro": "google/gemini-3-pro-image-preview",
+};
+
+const OPENROUTER_SIZE_MAP: Record<GeminiSize, string> = {
+  "512px": "0.5K",
+  "1K": "1K",
+  "2K": "2K",
+  "4K": "4K",
+};
 
 // ============================================================================
 // Error Handling
@@ -121,6 +136,7 @@ function showHelp(): void {
 generate-image - Image Generation CLI
 
 Generate images using Nano Banana 2 (default) or Nano Banana Pro.
+Supports Google Gemini API (direct) and OpenRouter as providers.
 
 USAGE:
   generate-image --prompt "<prompt>" [OPTIONS]
@@ -130,6 +146,8 @@ REQUIRED:
 
 OPTIONS:
   --model <model>          Model: nano-banana-2 (default), nano-banana-pro
+  --provider <provider>    API provider: google, openrouter
+                           Auto-detected from available API keys if not specified
   --size <size>            Resolution: 512px, 1K, 2K (default), 4K
                            512px is Nano Banana 2 only
   --aspect-ratio <ratio>   Aspect ratio (default: 16:9)
@@ -140,9 +158,9 @@ OPTIONS:
                            Accepts: PNG, JPEG, WebP images
   --transparent            Add transparency instructions to prompt
   --remove-bg              Remove background after generation (requires REMOVEBG_API_KEY)
-  --thinking <level>       Thinking level for NB2: minimal (default), high
+  --thinking <level>       Thinking level for NB2: minimal (default), high (Google only)
                            Use high for complex compositions with precise positioning
-  --grounded               Enable web search grounding (NB2 only)
+  --grounded               Enable web search grounding (NB2 only, Google only)
                            Real-time web/image search for accurate logos, landmarks, brands
   --creative-variations <n>  Generate N variations (appends -v1, -v2, etc.)
   --help, -h               Show this help message
@@ -171,9 +189,18 @@ EXAMPLES:
   generate-image --prompt "Abstract neural network" --creative-variations 3 --output /tmp/art.png
   # Outputs: /tmp/art-v1.png, /tmp/art-v2.png, /tmp/art-v3.png
 
+  # Use OpenRouter provider explicitly
+  generate-image --provider openrouter --prompt "A cozy cafe scene" --size 2K --output /tmp/cafe.png
+
 ENVIRONMENT VARIABLES:
-  GOOGLE_API_KEY       Required for both models
+  GOOGLE_API_KEY       Required for Google provider
+  OPENROUTER_KEY       Required for OpenRouter provider
   REMOVEBG_API_KEY     Required for --remove-bg flag
+
+PROVIDER AUTO-DETECTION:
+  If --provider is not specified, the CLI checks for available API keys:
+  1. GOOGLE_API_KEY found → uses Google provider
+  2. OPENROUTER_KEY found → uses OpenRouter provider
 
 ERROR CODES:
   0  Success
@@ -241,6 +268,13 @@ function parseArgs(argv: string[]): CLIArgs {
           throw new CLIError(`Invalid model: ${value}. Must be: nano-banana-2 or nano-banana-pro`);
         }
         parsed.model = value;
+        i++;
+        break;
+      case "provider":
+        if (value !== "google" && value !== "openrouter") {
+          throw new CLIError(`Invalid provider: ${value}. Must be: google or openrouter`);
+        }
+        parsed.provider = value as Provider;
         i++;
         break;
       case "prompt":
@@ -548,6 +582,113 @@ async function generateWithNanoBanana2(
 }
 
 // ============================================================================
+// OpenRouter Image Generation
+// ============================================================================
+
+async function generateWithOpenRouter(
+  model: Model,
+  prompt: string,
+  size: GeminiSize,
+  aspectRatio: AspectRatio,
+  output: string,
+  referenceImage?: string
+): Promise<void> {
+  const apiKey = process.env.OPENROUTER_KEY;
+  if (!apiKey) {
+    throw new CLIError("Missing environment variable: OPENROUTER_KEY");
+  }
+
+  const openrouterModel = OPENROUTER_MODELS[model];
+  const modelLabel = model === "nano-banana-pro" ? "Nano Banana Pro" : "Nano Banana 2";
+  const refLabel = referenceImage ? " with reference image" : "";
+  console.log(`Generating with ${modelLabel} via OpenRouter (${openrouterModel}) at ${size} ${aspectRatio}${refLabel}...`);
+
+  // Build message content
+  const content: Array<{ type: string; text?: string; image_url?: { url: string } }> = [];
+
+  if (referenceImage) {
+    const ref = await loadReferenceImage(referenceImage);
+    content.push({
+      type: "image_url",
+      image_url: { url: `data:${ref.mimeType};base64,${ref.data}` },
+    });
+  }
+
+  content.push({ type: "text", text: prompt });
+
+  const body = {
+    model: openrouterModel,
+    messages: [{ role: "user", content }],
+    modalities: ["image", "text"],
+    stream: false,
+    image_config: {
+      aspect_ratio: aspectRatio,
+      image_size: OPENROUTER_SIZE_MAP[size],
+    },
+  };
+
+  const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      "Authorization": `Bearer ${apiKey}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(body),
+  });
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new CLIError(`OpenRouter API error: ${response.status} - ${errorText}`);
+  }
+
+  const data = await response.json() as any;
+
+  const message = data.choices?.[0]?.message;
+  if (!message) {
+    throw new CLIError("OpenRouter returned empty response");
+  }
+
+  // Log text response if present
+  if (message.content && typeof message.content === "string" && message.content.trim()) {
+    console.log(`\nModel response: ${message.content}`);
+  }
+
+  // Extract image from the images array (OpenRouter extension)
+  let imageBase64: string | undefined;
+
+  if (message.images && Array.isArray(message.images) && message.images.length > 0) {
+    const imageUrl = message.images[0]?.image_url?.url;
+    if (imageUrl && imageUrl.startsWith("data:image/")) {
+      const commaIdx = imageUrl.indexOf(",");
+      if (commaIdx !== -1) {
+        imageBase64 = imageUrl.slice(commaIdx + 1);
+      }
+    }
+  }
+
+  // Fallback: check if content is an array with image parts
+  if (!imageBase64 && Array.isArray(message.content)) {
+    for (const part of message.content) {
+      if (part.type === "image_url" && part.image_url?.url?.startsWith("data:image/")) {
+        const commaIdx = part.image_url.url.indexOf(",");
+        if (commaIdx !== -1) {
+          imageBase64 = part.image_url.url.slice(commaIdx + 1);
+          break;
+        }
+      }
+    }
+  }
+
+  if (!imageBase64) {
+    throw new CLIError("No image data returned from OpenRouter API");
+  }
+
+  const imageBuffer = Buffer.from(imageBase64, "base64");
+  await writeFile(output, imageBuffer);
+  console.log(`Image saved to ${output}`);
+}
+
+// ============================================================================
 // Response Extraction Helper
 // ============================================================================
 
@@ -582,6 +723,28 @@ async function main(): Promise<void> {
 
     const args = parseArgs(process.argv);
 
+    // Determine provider (explicit flag > auto-detect from API keys)
+    let provider: Provider;
+    if (args.provider) {
+      provider = args.provider;
+    } else if (process.env.GOOGLE_API_KEY) {
+      provider = "google";
+    } else if (process.env.OPENROUTER_KEY) {
+      provider = "openrouter";
+    } else {
+      throw new CLIError("No API key found. Set GOOGLE_API_KEY or OPENROUTER_KEY in ~/.claude/.env");
+    }
+
+    // Warn about provider-specific features when using OpenRouter
+    if (provider === "openrouter") {
+      if (args.thinking) {
+        console.warn("Warning: --thinking is not supported with OpenRouter provider, ignoring");
+      }
+      if (args.grounded) {
+        console.warn("Warning: --grounded is not supported with OpenRouter provider, ignoring");
+      }
+    }
+
     // Enhance prompt for transparency if requested
     const finalPrompt = args.transparent
       ? enhancePromptForTransparency(args.prompt)
@@ -591,6 +754,17 @@ async function main(): Promise<void> {
       console.log("Transparent background mode enabled");
       console.log("Note: Not all models support transparency natively; may require post-processing\n");
     }
+
+    // Generate function dispatcher
+    const generate = (prompt: string, output: string): Promise<void> => {
+      if (provider === "openrouter") {
+        return generateWithOpenRouter(args.model, prompt, args.size, args.aspectRatio, output, args.referenceImage);
+      }
+      if (args.model === "nano-banana-pro") {
+        return generateWithNanoBananaPro(prompt, args.size, args.aspectRatio, output, args.referenceImage);
+      }
+      return generateWithNanoBanana2(prompt, args.size, args.aspectRatio, output, args.referenceImage, args.thinking, args.grounded);
+    };
 
     // Handle creative variations mode
     if (args.creativeVariations && args.creativeVariations > 1) {
@@ -603,16 +777,7 @@ async function main(): Promise<void> {
       for (let i = 1; i <= args.creativeVariations; i++) {
         const varOutput = `${basePath}-v${i}.png`;
         console.log(`Variation ${i}/${args.creativeVariations}: ${varOutput}`);
-
-        if (args.model === "nano-banana-pro") {
-          promises.push(
-            generateWithNanoBananaPro(finalPrompt, args.size, args.aspectRatio, varOutput, args.referenceImage)
-          );
-        } else {
-          promises.push(
-            generateWithNanoBanana2(finalPrompt, args.size, args.aspectRatio, varOutput, args.referenceImage, args.thinking, args.grounded)
-          );
-        }
+        promises.push(generate(finalPrompt, varOutput));
       }
 
       await Promise.all(promises);
@@ -621,11 +786,7 @@ async function main(): Promise<void> {
     }
 
     // Standard single image generation
-    if (args.model === "nano-banana-pro") {
-      await generateWithNanoBananaPro(finalPrompt, args.size, args.aspectRatio, args.output, args.referenceImage);
-    } else {
-      await generateWithNanoBanana2(finalPrompt, args.size, args.aspectRatio, args.output, args.referenceImage, args.thinking, args.grounded);
-    }
+    await generate(finalPrompt, args.output);
 
     // Remove background if requested
     if (args.removeBg) {
